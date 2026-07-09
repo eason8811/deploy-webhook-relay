@@ -1,0 +1,28 @@
+name: deploy-webhook-relay-test
+
+services:
+  deploy-webhook-relay-test:
+    build:
+      context: .
+    image: local/deploy-webhook-relay-test:latest
+    container_name: deploy-webhook-relay-test
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()\nPY"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      apex-camp-test-net:
+        aliases:
+          - deploy-webhook-relay-test
+
+networks:
+  apex-camp-test-net:
+    external: true
+    name: ${TEST_DOCKER_NETWORK:-apex-camp-test_apex-camp-test-net}
