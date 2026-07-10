@@ -4,6 +4,11 @@ services:
   deploy-webhook-relay:
     build:
       context: .
+      network: host
+      args:
+        HTTP_PROXY: http://127.0.0.1:7890
+        HTTPS_PROXY: http://127.0.0.1:7890
+        NO_PROXY: localhost,127.0.0.1,::1
     image: local/deploy-webhook-relay:latest
     container_name: deploy-webhook-relay
     restart: unless-stopped
