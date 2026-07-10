@@ -1,12 +1,28 @@
+import asyncio
 import hashlib
 import hmac
 import logging
 import os
+from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Dict, List, Set
+from uuid import uuid4
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+from .notifications import (
+    EmailConfig,
+    SyncResult,
+    WebhookContext,
+    build_webhook_context,
+    infer_pull_request,
+    render_received_email,
+    render_result_email,
+    resolve_pull_request,
+    send_email,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -23,7 +39,17 @@ PORTAL_PREFIX = os.getenv("PORTAL_PREFIX", "environments/production/portal-111/"
 ARCANE_CORE_WEBHOOK_URL = os.getenv("ARCANE_CORE_WEBHOOK_URL", "")
 ARCANE_PORTAL_WEBHOOK_URL = os.getenv("ARCANE_PORTAL_WEBHOOK_URL", "")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
-HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
+HTTP_CONNECT_TIMEOUT_SECONDS = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "10"))
+HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "600"))
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_API_TIMEOUT_SECONDS = float(os.getenv("GITHUB_API_TIMEOUT_SECONDS", "5"))
+GITHUB_API_VERSION = os.getenv("GITHUB_API_VERSION", "2026-03-10")
+EMAIL_CONFIG = EmailConfig.from_env("ApexCamp Production")
+
+if EMAIL_CONFIG.enabled and not EMAIL_CONFIG.configured:
+    logger.error(
+        "Email notifications enabled but invalid: %s", EMAIL_CONFIG.validation_error
+    )
 
 
 def verify_github_signature(body: bytes, signature: str | None) -> None:
@@ -34,9 +60,10 @@ def verify_github_signature(body: bytes, signature: str | None) -> None:
     if not signature or not signature.startswith("sha256="):
         raise HTTPException(status_code=401, detail="missing github signature")
 
-    expected = "sha256=" + hmac.new(
-        WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256
-    ).hexdigest()
+    expected = (
+        "sha256="
+        + hmac.new(WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    )
 
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="invalid github signature")
@@ -69,14 +96,54 @@ def classify_targets(changed_files: List[str]) -> List[str]:
     return targets
 
 
-async def post_arcane_webhook(target: str, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def build_sync_result(
+    *,
+    target: str,
+    status: str,
+    ok: bool,
+    started_at: float,
+    status_code: int | None = None,
+    arcane_success: bool | None = None,
+    data: Any = None,
+    error: str = "",
+    response_excerpt: str = "",
+) -> SyncResult:
+    return SyncResult(
+        target=target,
+        status=status,
+        ok=ok,
+        status_code=status_code,
+        arcane_success=arcane_success,
+        data=data,
+        error=error,
+        response_excerpt=response_excerpt,
+        duration_seconds=monotonic() - started_at,
+        completed_at=datetime.now(timezone.utc),
+    )
+
+
+async def post_arcane_webhook(
+    target: str, url: str, payload: Dict[str, Any]
+) -> SyncResult:
+    started_at = monotonic()
     if not url:
         logger.error("Arcane webhook URL for target=%s is not configured", target)
-        return {"target": target, "ok": False, "error": "missing Arcane webhook URL"}
+        return build_sync_result(
+            target=target,
+            status="failed",
+            ok=False,
+            started_at=started_at,
+            error="missing Arcane webhook URL",
+        )
 
     if DRY_RUN:
-        logger.info("DRY_RUN enabled; skip Arcane webhook target=%s url=%s", target, url)
-        return {"target": target, "ok": True, "dry_run": True}
+        logger.info("DRY_RUN enabled; skip Arcane webhook target=%s", target)
+        return build_sync_result(
+            target=target,
+            status="skipped",
+            ok=False,
+            started_at=started_at,
+        )
 
     body = {
         "source": "apexcamp-deploy-webhook-relay",
@@ -89,31 +156,165 @@ async def post_arcane_webhook(target: str, url: str, payload: Dict[str, Any]) ->
     }
 
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=True) as client:
-            resp = await client.post(url, json=body, headers={"User-Agent": "apexcamp-deploy-webhook-relay"})
+        timeout = httpx.Timeout(
+            connect=HTTP_CONNECT_TIMEOUT_SECONDS,
+            read=HTTP_TIMEOUT_SECONDS,
+            write=HTTP_CONNECT_TIMEOUT_SECONDS,
+            pool=HTTP_CONNECT_TIMEOUT_SECONDS,
+        )
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.post(
+                url, json=body, headers={"User-Agent": "apexcamp-deploy-webhook-relay"}
+            )
+            response_excerpt = resp.text[:500]
+            parsed: Any = None
+            try:
+                parsed = resp.json()
+            except ValueError:
+                parsed = None
+
+            arcane_success = parsed.get("success") if isinstance(parsed, dict) else None
+            data = parsed.get("data") if isinstance(parsed, dict) else None
+            ok = 200 <= resp.status_code < 300 and arcane_success is True
+            error = ""
+            if not 200 <= resp.status_code < 300:
+                error = (
+                    str(
+                        parsed.get("error")
+                        or f"Arcane returned HTTP {resp.status_code}"
+                    )
+                    if isinstance(parsed, dict)
+                    else f"Arcane returned HTTP {resp.status_code}"
+                )
+            elif arcane_success is not True:
+                error = "Arcane response did not contain success=true"
+
             logger.info(
-                "Arcane webhook target=%s status=%s body=%s",
+                "Arcane webhook target=%s status=%s success=%s body=%s",
                 target,
                 resp.status_code,
-                resp.text[:500],
+                arcane_success,
+                response_excerpt,
             )
-            return {
-                "target": target,
-                "ok": 200 <= resp.status_code < 300,
-                "status_code": resp.status_code,
-            }
+            return build_sync_result(
+                target=target,
+                status="success" if ok else "failed",
+                ok=ok,
+                started_at=started_at,
+                status_code=resp.status_code,
+                arcane_success=arcane_success
+                if isinstance(arcane_success, bool)
+                else None,
+                data=data,
+                error=error,
+                response_excerpt=response_excerpt,
+            )
+    except httpx.TimeoutException as exc:
+        logger.error(
+            "Arcane webhook target=%s timed out error_type=%s connect_timeout=%ss read_timeout=%ss",
+            target,
+            type(exc).__name__,
+            HTTP_CONNECT_TIMEOUT_SECONDS,
+            HTTP_TIMEOUT_SECONDS,
+        )
+        return build_sync_result(
+            target=target,
+            status="failed",
+            ok=False,
+            started_at=started_at,
+            error=(
+                f"Arcane request timed out ({type(exc).__name__}; "
+                f"connect={HTTP_CONNECT_TIMEOUT_SECONDS:g}s, read={HTTP_TIMEOUT_SECONDS:g}s)"
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Arcane webhook target=%s failed", target)
-        return {"target": target, "ok": False, "error": str(exc)}
+        logger.error(
+            "Arcane webhook target=%s failed error_type=%s", target, type(exc).__name__
+        )
+        return build_sync_result(
+            target=target,
+            status="failed",
+            ok=False,
+            started_at=started_at,
+            error=f"Arcane request failed ({type(exc).__name__})",
+        )
 
 
-async def dispatch_arcane_webhooks(targets: List[str], payload: Dict[str, Any]) -> None:
-    logger.info("Dispatch targets=%s ref=%s after=%s", targets, payload.get("ref"), payload.get("after"))
+async def run_arcane_webhooks(
+    targets: List[str], payload: Dict[str, Any]
+) -> List[SyncResult]:
+    results: List[SyncResult] = []
     for target in targets:
         if target == "core":
-            await post_arcane_webhook("core", ARCANE_CORE_WEBHOOK_URL, payload)
+            results.append(
+                await post_arcane_webhook("core", ARCANE_CORE_WEBHOOK_URL, payload)
+            )
         elif target == "portal":
-            await post_arcane_webhook("portal", ARCANE_PORTAL_WEBHOOK_URL, payload)
+            results.append(
+                await post_arcane_webhook("portal", ARCANE_PORTAL_WEBHOOK_URL, payload)
+            )
+    return results
+
+
+async def dispatch_arcane_webhooks(
+    targets: List[str], payload: Dict[str, Any], context: WebhookContext
+) -> None:
+    logger.info(
+        "Dispatch delivery_id=%s targets=%s ref=%s after=%s",
+        context.delivery_id,
+        targets,
+        payload.get("ref"),
+        payload.get("after"),
+    )
+    arcane_task = asyncio.create_task(run_arcane_webhooks(targets, payload))
+    pull_request = infer_pull_request(context)
+
+    if EMAIL_CONFIG.enabled:
+        pull_request = await resolve_pull_request(
+            context,
+            token=GITHUB_TOKEN,
+            timeout_seconds=GITHUB_API_TIMEOUT_SECONDS,
+            api_version=GITHUB_API_VERSION,
+            logger=logger,
+        )
+        try:
+            subject, text_body, html_body = render_received_email(
+                context, pull_request, EMAIL_CONFIG
+            )
+            await send_email(
+                EMAIL_CONFIG,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                delivery_id=context.delivery_id,
+                phase="received",
+                logger=logger,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Received email rendering failed delivery_id=%s", context.delivery_id
+            )
+
+    results = await arcane_task
+
+    if EMAIL_CONFIG.enabled:
+        try:
+            subject, text_body, html_body = render_result_email(
+                context, pull_request, results, EMAIL_CONFIG
+            )
+            await send_email(
+                EMAIL_CONFIG,
+                subject=subject,
+                text_body=text_body,
+                html_body=html_body,
+                delivery_id=context.delivery_id,
+                phase="result",
+                logger=logger,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Result email rendering failed delivery_id=%s", context.delivery_id
+            )
 
 
 @app.get("/healthz")
@@ -124,6 +325,11 @@ def healthz() -> Dict[str, Any]:
         "deploy_ref": DEPLOY_REF,
         "core_webhook_configured": bool(ARCANE_CORE_WEBHOOK_URL),
         "portal_webhook_configured": bool(ARCANE_PORTAL_WEBHOOK_URL),
+        "email_enabled": EMAIL_CONFIG.enabled,
+        "email_configured": EMAIL_CONFIG.configured,
+        "github_pr_lookup_configured": bool(GITHUB_TOKEN),
+        "arcane_connect_timeout_seconds": HTTP_CONNECT_TIMEOUT_SECONDS,
+        "arcane_read_timeout_seconds": HTTP_TIMEOUT_SECONDS,
     }
 
 
@@ -132,13 +338,21 @@ async def github_deploy_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     x_github_event: str | None = Header(default=None),
+    x_github_delivery: str | None = Header(default=None),
     x_hub_signature_256: str | None = Header(default=None),
 ) -> JSONResponse:
+    received_at = datetime.now(timezone.utc)
     body = await request.body()
     verify_github_signature(body, x_hub_signature_256)
 
     if x_github_event != "push":
-        return JSONResponse({"ok": True, "ignored": True, "reason": f"unsupported event {x_github_event}"})
+        return JSONResponse(
+            {
+                "ok": True,
+                "ignored": True,
+                "reason": f"unsupported event {x_github_event}",
+            }
+        )
 
     try:
         payload = await request.json()
@@ -147,23 +361,46 @@ async def github_deploy_webhook(
 
     ref = payload.get("ref")
     if ref != DEPLOY_REF:
-        return JSONResponse({"ok": True, "ignored": True, "reason": f"ref {ref} != {DEPLOY_REF}"})
+        return JSONResponse(
+            {"ok": True, "ignored": True, "reason": f"ref {ref} != {DEPLOY_REF}"}
+        )
 
     changed_files = collect_changed_files(payload)
     targets = classify_targets(changed_files)
 
-    logger.info("Webhook received ref=%s changed=%s targets=%s", ref, changed_files, targets)
+    logger.info(
+        "Webhook received ref=%s changed=%s targets=%s", ref, changed_files, targets
+    )
 
     if not targets:
-        return JSONResponse({"ok": True, "ignored": True, "reason": "no production core/portal changes", "changed_files": changed_files})
+        return JSONResponse(
+            {
+                "ok": True,
+                "ignored": True,
+                "reason": "no production core/portal changes",
+                "changed_files": changed_files,
+            }
+        )
 
-    background_tasks.add_task(dispatch_arcane_webhooks, targets, payload)
+    delivery_id = x_github_delivery or str(uuid4())
+    context = build_webhook_context(
+        payload,
+        delivery_id=delivery_id,
+        event=x_github_event,
+        environment_name=EMAIL_CONFIG.environment_name,
+        targets=targets,
+        changed_files=changed_files,
+        received_at=received_at,
+        dry_run=DRY_RUN,
+    )
+    background_tasks.add_task(dispatch_arcane_webhooks, targets, payload, context)
 
     return JSONResponse(
         status_code=202,
         content={
             "ok": True,
             "accepted": True,
+            "delivery_id": delivery_id,
             "dry_run": DRY_RUN,
             "targets": targets,
             "changed_files": changed_files,

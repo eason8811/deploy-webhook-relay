@@ -1,9 +1,18 @@
 [project]
 name = "deploy-webhook-relay"
 version = "0.1.0"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.139.0",
     "httpx>=0.28.1",
+    "tzdata>=2026.3",
     "uvicorn>=0.51.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
+
+[tool.ruff]
+target-version = "py312"

@@ -1,0 +1,26 @@
+{
+  "ref": "refs/heads/main",
+  "before": "9b4a0e37f81ccc5fca450f59fd5428932534813b",
+  "after": "0e0ac1e7f42bc8692707eafe9c55e2513a710044",
+  "compare": "https://github.com/eason8811/apex-camp-deploy/compare/9b4a0e37f81c...0e0ac1e7f42b",
+  "repository": {
+    "full_name": "eason8811/apex-camp-deploy",
+    "html_url": "https://github.com/eason8811/apex-camp-deploy",
+    "default_branch": "main"
+  },
+  "pusher": {"name": "eason8811"},
+  "sender": {"login": "eason8811"},
+  "head_commit": {
+    "id": "0e0ac1e7f42bc8692707eafe9c55e2513a710044",
+    "message": "Merge pull request #27 from eason8811/ci/test/apex-community-c83496c693a4\n\nchore(test): update core image digests c83496c693a4",
+    "timestamp": "2026-07-10T11:13:11+08:00",
+    "url": "https://github.com/eason8811/apex-camp-deploy/commit/0e0ac1e7f42bc8692707eafe9c55e2513a710044",
+    "added": [],
+    "removed": [],
+    "modified": [
+      "environments/test/docker-compose.yaml",
+      "environments/test/release.lock.yaml"
+    ]
+  },
+  "commits": []
+}

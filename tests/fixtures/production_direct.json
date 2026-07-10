@@ -1,0 +1,23 @@
+{
+  "ref": "refs/heads/main",
+  "before": "d915c65438e69bfa15f13c654ffee75a35dc3cd8",
+  "after": "bb678365312b5ef4a3d1df7fcc992c0fd4d44291",
+  "compare": "https://github.com/eason8811/apex-camp-deploy/compare/d915c65438e6...bb678365312b",
+  "repository": {
+    "full_name": "eason8811/apex-camp-deploy",
+    "html_url": "https://github.com/eason8811/apex-camp-deploy",
+    "default_branch": "main"
+  },
+  "pusher": {"name": "eason8811"},
+  "sender": {"login": "eason8811"},
+  "head_commit": {
+    "id": "bb678365312b5ef4a3d1df7fcc992c0fd4d44291",
+    "message": "chore(srs): add production configuration",
+    "timestamp": "2026-07-10T00:33:19+08:00",
+    "url": "https://github.com/eason8811/apex-camp-deploy/commit/bb678365312b5ef4a3d1df7fcc992c0fd4d44291",
+    "added": ["environments/production/core/srs/srs.conf"],
+    "removed": [],
+    "modified": []
+  },
+  "commits": []
+}
