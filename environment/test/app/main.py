@@ -14,13 +14,14 @@ from fastapi.responses import JSONResponse
 
 from .notifications import (
     EmailConfig,
+    PullRequestInfo,
+    PullRequestVerificationError,
     SyncResult,
     WebhookContext,
     build_webhook_context,
-    infer_pull_request,
     render_received_email,
     render_result_email,
-    resolve_pull_request,
+    resolve_merged_pull_request,
     send_email,
 )
 
@@ -43,6 +44,11 @@ HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "600"))
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_API_TIMEOUT_SECONDS = float(os.getenv("GITHUB_API_TIMEOUT_SECONDS", "5"))
 GITHUB_API_VERSION = os.getenv("GITHUB_API_VERSION", "2026-03-10")
+CI_PULL_REQUEST_HEAD_PREFIXES = tuple(
+    prefix.strip()
+    for prefix in os.getenv("CI_PULL_REQUEST_HEAD_PREFIXES", "ci/").split(",")
+    if prefix.strip()
+)
 EMAIL_CONFIG = EmailConfig.from_env("ApexCamp Test")
 
 if EMAIL_CONFIG.enabled and not EMAIL_CONFIG.configured:
@@ -88,6 +94,13 @@ def collect_changed_files(payload: Dict[str, Any]) -> List[str]:
 
 def should_trigger_test(changed_files: List[str]) -> bool:
     return any(path.startswith(TEST_PREFIX) for path in changed_files)
+
+
+def is_ci_generated_pull_request(pull_request: PullRequestInfo) -> bool:
+    return pull_request.is_merge and any(
+        pull_request.head_ref.startswith(prefix)
+        for prefix in CI_PULL_REQUEST_HEAD_PREFIXES
+    )
 
 
 def build_sync_result(
@@ -227,7 +240,10 @@ async def post_arcane_test_webhook(
 
 
 async def dispatch_test_webhook(
-    payload: Dict[str, Any], changed_files: List[str], context: WebhookContext
+    payload: Dict[str, Any],
+    changed_files: List[str],
+    context: WebhookContext,
+    pull_request: PullRequestInfo,
 ) -> None:
     logger.info(
         "Dispatch test webhook delivery_id=%s ref=%s after=%s changed_files=%s",
@@ -237,16 +253,9 @@ async def dispatch_test_webhook(
         changed_files,
     )
     arcane_task = asyncio.create_task(post_arcane_test_webhook(payload, changed_files))
-    pull_request = infer_pull_request(context)
+    await asyncio.sleep(0)
 
     if EMAIL_CONFIG.enabled:
-        pull_request = await resolve_pull_request(
-            context,
-            token=GITHUB_TOKEN,
-            timeout_seconds=GITHUB_API_TIMEOUT_SECONDS,
-            api_version=GITHUB_API_VERSION,
-            logger=logger,
-        )
         try:
             subject, text_body, html_body = render_received_email(
                 context, pull_request, EMAIL_CONFIG
@@ -298,7 +307,8 @@ def healthz() -> Dict[str, Any]:
         "test_webhook_configured": bool(ARCANE_TEST_WEBHOOK_URL),
         "email_enabled": EMAIL_CONFIG.enabled,
         "email_configured": EMAIL_CONFIG.configured,
-        "github_pr_lookup_configured": bool(GITHUB_TOKEN),
+        "github_pr_merge_verification_configured": bool(GITHUB_TOKEN),
+        "ci_pull_request_head_prefixes": CI_PULL_REQUEST_HEAD_PREFIXES,
         "arcane_connect_timeout_seconds": HTTP_CONNECT_TIMEOUT_SECONDS,
         "arcane_read_timeout_seconds": HTTP_TIMEOUT_SECONDS,
     }
@@ -378,7 +388,49 @@ async def github_deploy_webhook(
         received_at=received_at,
         dry_run=DRY_RUN,
     )
-    background_tasks.add_task(dispatch_test_webhook, payload, changed_files, context)
+    try:
+        pull_request = await resolve_merged_pull_request(
+            context,
+            token=GITHUB_TOKEN,
+            timeout_seconds=GITHUB_API_TIMEOUT_SECONDS,
+            api_version=GITHUB_API_VERSION,
+            logger=logger,
+        )
+    except PullRequestVerificationError as exc:
+        logger.error(
+            "Rejecting delivery_id=%s because merged PR verification failed: %s",
+            delivery_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="merged pull request verification is unavailable",
+        ) from exc
+
+    if pull_request is None:
+        return JSONResponse(
+            {
+                "ok": True,
+                "ignored": True,
+                "reason": "push is not the merge commit of a pull request",
+                "changed_files": changed_files,
+            }
+        )
+
+    if not is_ci_generated_pull_request(pull_request):
+        return JSONResponse(
+            {
+                "ok": True,
+                "ignored": True,
+                "reason": "pull request was not created by the CI branch policy",
+                "pull_request": pull_request.number,
+                "head_ref": pull_request.head_ref,
+            }
+        )
+
+    background_tasks.add_task(
+        dispatch_test_webhook, payload, changed_files, context, pull_request
+    )
 
     return JSONResponse(
         status_code=202,

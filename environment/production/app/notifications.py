@@ -143,6 +143,10 @@ class PullRequestInfo:
     merged_by: str = ""
 
 
+class PullRequestVerificationError(RuntimeError):
+    """GitHub could not authoritatively verify the commit's merged PR."""
+
+
 @dataclass(frozen=True)
 class SyncResult:
     target: str
@@ -258,8 +262,37 @@ async def resolve_pull_request(
     logger: logging.Logger,
 ) -> PullRequestInfo:
     fallback = infer_pull_request(context)
-    if not token or "/" not in context.repository or not context.after:
+    try:
+        resolved = await resolve_merged_pull_request(
+            context,
+            token=token,
+            timeout_seconds=timeout_seconds,
+            api_version=api_version,
+            logger=logger,
+        )
+    except PullRequestVerificationError as exc:
+        logger.warning(
+            "GitHub PR lookup failed delivery_id=%s error=%s; use commit fallback",
+            context.delivery_id,
+            exc,
+        )
         return fallback
+    return resolved or fallback
+
+
+async def resolve_merged_pull_request(
+    context: WebhookContext,
+    *,
+    token: str,
+    timeout_seconds: float,
+    api_version: str,
+    logger: logging.Logger,
+) -> PullRequestInfo | None:
+    """Return the PR merged by ``context.after``; never infer it from a message."""
+    if not token:
+        raise PullRequestVerificationError("GITHUB_TOKEN is not configured")
+    if "/" not in context.repository or not context.after:
+        raise PullRequestVerificationError("push payload is missing repository or after")
 
     owner, repository = context.repository.split("/", 1)
     url = f"https://api.github.com/repos/{owner}/{repository}/commits/{context.after}/pulls"
@@ -280,12 +313,7 @@ async def resolve_pull_request(
         if not isinstance(payload, list):
             raise ValueError("GitHub PR lookup returned a non-list payload")
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "GitHub PR lookup failed delivery_id=%s error=%s; use commit fallback",
-            context.delivery_id,
-            exc,
-        )
-        return fallback
+        raise PullRequestVerificationError(type(exc).__name__) from exc
 
     candidates = [
         item
@@ -296,7 +324,7 @@ async def resolve_pull_request(
         and ((item.get("base") or {}).get("ref") == context.target_branch)
     ]
     if not candidates:
-        return fallback
+        return None
 
     selected = max(candidates, key=lambda item: str(item.get("merged_at") or ""))
     return PullRequestInfo(

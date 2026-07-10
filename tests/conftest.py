@@ -14,6 +14,8 @@ ENV_KEYS = {
     "ARCANE_CORE_WEBHOOK_URL",
     "ARCANE_PORTAL_WEBHOOK_URL",
     "ARCANE_TEST_WEBHOOK_URL",
+    "CI_PULL_REQUEST_HEAD_PREFIXES",
+    "DEPLOY_REPOSITORY",
     "DRY_RUN",
     "EMAIL_ENABLED",
     "EMAIL_LOGO_URL",
@@ -56,6 +58,7 @@ def load_environment(monkeypatch):
             "ARCANE_CORE_WEBHOOK_URL": "https://arcane.example/api/webhooks/trigger/core-secret",
             "ARCANE_PORTAL_WEBHOOK_URL": "https://arcane.example/api/webhooks/trigger/portal-secret",
             "ARCANE_TEST_WEBHOOK_URL": "https://arcane.example/api/webhooks/trigger/test-secret",
+            "GITHUB_TOKEN": "test-github-token",
         }
         defaults.update(overrides)
         for key, value in defaults.items():

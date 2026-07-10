@@ -4,6 +4,11 @@ Flow:
 
 GitHub deploy repo push -> Relay -> Arcane Git Sync WebHook
 
+The relay only continues when GitHub confirms the pushed commit is the merge
+commit of a CI-created PR (default source-branch prefix: `ci/`). Direct pushes,
+manual PRs, and commits that cannot be verified are never sent to Arcane; a
+verification outage returns HTTP 503 so GitHub can retry delivery.
+
 - `environments/production/core/**` triggers core Arcane webhook.
 - `environments/production/portal-111/**` triggers portal Arcane webhook.
 - Other changes are ignored.
@@ -29,7 +34,8 @@ docker compose --env-file .env -f docker-compose.yaml up -d --build
 ```
 
 Before enabling email, configure the SMTP fields and a fine-grained
-`GITHUB_TOKEN` with `Pull requests: read` access to the deploy repository. Keep
+`GITHUB_TOKEN` with `Pull requests: read` access to the deploy repository. The
+token is required for merge verification even when email is disabled. Keep
 `EMAIL_ENABLED=false` and `DRY_RUN=true` for the first deployment, verify the
 received and skipped-result emails, then enable the real Arcane call.
 

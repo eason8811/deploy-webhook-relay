@@ -128,6 +128,53 @@ def test_github_api_result_takes_precedence(
     assert result.head_ref == "ci/prod/core/1fe1fc9aa159"
 
 
+def test_strict_pr_verification_rejects_a_non_merge_commit(
+    load_environment, payload_fixture, monkeypatch
+):
+    module = load_environment("production", "app.notifications")
+    context = make_context(module, payload_fixture("production_direct.json"))
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "number": 99,
+                    "merged_at": "2026-07-10T03:40:01Z",
+                    "merge_commit_sha": "a-different-commit",
+                    "base": {"ref": "main"},
+                }
+            ]
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, url, headers):
+            return FakeResponse()
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(
+        module.resolve_merged_pull_request(
+            context,
+            token="token",
+            timeout_seconds=5,
+            api_version="2026-03-10",
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert result is None
+
+
 def test_github_api_failure_uses_commit_fallback(
     load_environment, payload_fixture, monkeypatch
 ):

@@ -19,6 +19,20 @@ def signed_headers(body: bytes, *, event="push", delivery="delivery-123"):
     }
 
 
+def merged_ci_pull_request(module, *, head_ref="ci/test/apex-community-c83496c693a4"):
+    return module.PullRequestInfo(
+        is_merge=True,
+        source="github_api",
+        number=27,
+        title="Update deployment image digests",
+        url="https://github.com/eason8811/apex-camp-deploy/pull/27",
+        head_ref=head_ref,
+        base_ref="main",
+        merged_at="2026-07-10T03:13:11Z",
+        merged_by="eason8811",
+    )
+
+
 @pytest.mark.parametrize(
     ("environment", "fixture_name", "path", "target_key", "target_value"),
     [
@@ -35,6 +49,7 @@ def signed_headers(body: bytes, *, event="push", delivery="delivery-123"):
 def test_non_ignored_webhook_returns_delivery_id(
     load_environment,
     payload_fixture,
+    monkeypatch,
     environment,
     fixture_name,
     path,
@@ -42,6 +57,11 @@ def test_non_ignored_webhook_returns_delivery_id(
     target_value,
 ):
     module = load_environment(environment)
+
+    async def fake_resolve(context, **kwargs):
+        return merged_ci_pull_request(module)
+
+    monkeypatch.setattr(module, "resolve_merged_pull_request", fake_resolve)
     payload = payload_fixture(fixture_name)
     body = json.dumps(payload, separators=(",", ":")).encode()
 
@@ -52,6 +72,102 @@ def test_non_ignored_webhook_returns_delivery_id(
     assert response.status_code == 202
     assert response.json()["delivery_id"] == "delivery-123"
     assert response.json()[target_key] == target_value
+
+
+@pytest.mark.parametrize(
+    ("environment", "fixture_name", "path", "dispatch_name"),
+    [
+        (
+            "production",
+            "production_direct.json",
+            "/webhooks/deploy",
+            "dispatch_arcane_webhooks",
+        ),
+        ("test", "test_merge.json", "/webhooks/deploy-test", "dispatch_test_webhook"),
+    ],
+)
+def test_non_pr_push_with_deploy_changes_is_ignored_before_dispatch(
+    load_environment,
+    payload_fixture,
+    monkeypatch,
+    environment,
+    fixture_name,
+    path,
+    dispatch_name,
+):
+    module = load_environment(environment)
+    payload = payload_fixture(fixture_name)
+    payload["head_commit"]["message"] = "Merge remote-tracking branch 'origin/main'"
+    called = []
+
+    async def fake_resolve(context, **kwargs):
+        return None
+
+    async def fake_dispatch(*args):
+        called.append(args)
+
+    monkeypatch.setattr(module, "resolve_merged_pull_request", fake_resolve)
+    monkeypatch.setattr(module, dispatch_name, fake_dispatch)
+    body = json.dumps(payload, separators=(",", ":")).encode()
+
+    response = TestClient(module.app).post(
+        path, content=body, headers=signed_headers(body)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ignored"] is True
+    assert response.json()["reason"] == "push is not the merge commit of a pull request"
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    ("environment", "fixture_name", "path"),
+    [
+        ("production", "production_merge.json", "/webhooks/deploy"),
+        ("test", "test_merge.json", "/webhooks/deploy-test"),
+    ],
+)
+def test_non_ci_pull_request_is_ignored_before_dispatch(
+    load_environment, payload_fixture, monkeypatch, environment, fixture_name, path
+):
+    module = load_environment(environment)
+    payload = payload_fixture(fixture_name)
+
+    async def fake_resolve(context, **kwargs):
+        return merged_ci_pull_request(module, head_ref="feature/manual-deploy-change")
+
+    monkeypatch.setattr(module, "resolve_merged_pull_request", fake_resolve)
+    body = json.dumps(payload, separators=(",", ":")).encode()
+
+    response = TestClient(module.app).post(
+        path, content=body, headers=signed_headers(body)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ignored"] is True
+    assert response.json()["reason"] == "pull request was not created by the CI branch policy"
+
+
+@pytest.mark.parametrize(
+    ("environment", "fixture_name", "path"),
+    [
+        ("production", "production_merge.json", "/webhooks/deploy"),
+        ("test", "test_merge.json", "/webhooks/deploy-test"),
+    ],
+)
+def test_unavailable_merged_pr_verification_returns_retryable_error(
+    load_environment, payload_fixture, environment, fixture_name, path
+):
+    module = load_environment(environment, GITHUB_TOKEN="")
+    payload = payload_fixture(fixture_name)
+    body = json.dumps(payload, separators=(",", ":")).encode()
+
+    response = TestClient(module.app).post(
+        path, content=body, headers=signed_headers(body)
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "merged pull request verification is unavailable"
 
 
 @pytest.mark.parametrize(
@@ -202,7 +318,7 @@ def test_dispatch_preserves_email_order_and_continues_after_email_failure(
     load_environment, payload_fixture, monkeypatch
 ):
     module = load_environment("production", EMAIL_ENABLED="false")
-    notifications = module.infer_pull_request.__module__
+    notifications = module.PullRequestInfo.__module__
     notification_module = __import__(notifications, fromlist=["EmailConfig"])
     payload = payload_fixture("production_merge.json")
     changed_files = module.collect_changed_files(payload)
@@ -251,19 +367,18 @@ def test_dispatch_preserves_email_order_and_continues_after_email_failure(
             )
         ]
 
-    async def fake_resolve(context, **kwargs):
-        await asyncio.sleep(0)
-        return module.infer_pull_request(context)
-
     async def fake_send(config, *, phase, **kwargs):
         events.append(phase)
         return phase != "received"
 
     monkeypatch.setattr(module, "run_arcane_webhooks", fake_run_arcane)
-    monkeypatch.setattr(module, "resolve_pull_request", fake_resolve)
     monkeypatch.setattr(module, "send_email", fake_send)
 
-    asyncio.run(module.dispatch_arcane_webhooks(["core"], payload, context))
+    asyncio.run(
+        module.dispatch_arcane_webhooks(
+            ["core"], payload, context, merged_ci_pull_request(module)
+        )
+    )
 
     assert events[0] == "arcane_started"
     assert events.index("received") < events.index("result")
