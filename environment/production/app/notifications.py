@@ -9,7 +9,8 @@ import ssl
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import format_datetime as format_email_datetime
+from email.utils import make_msgid, parseaddr
 from typing import Any, Iterable
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -428,12 +429,14 @@ async def send_email(
         return False
 
     try:
-        await asyncio.to_thread(
+        refused_recipients, message_id = await asyncio.to_thread(
             _send_email_sync,
             config,
             _sanitize_subject(subject),
             text_body,
             html_body,
+            delivery_id,
+            phase,
         )
     except Exception:  # noqa: BLE001
         logger.exception(
@@ -444,11 +447,22 @@ async def send_email(
         )
         return False
 
+    if refused_recipients:
+        logger.error(
+            "Email partially refused delivery_id=%s phase=%s refused=%s recipients=%s",
+            delivery_id,
+            phase,
+            len(refused_recipients),
+            len(config.to_addresses),
+        )
+        return False
+
     logger.info(
-        "Email sent delivery_id=%s phase=%s recipients=%s",
+        "Email sent delivery_id=%s phase=%s recipients=%s message_id=%s",
         delivery_id,
         phase,
         len(config.to_addresses),
+        message_id,
     )
     return True
 
@@ -458,12 +472,25 @@ def _sanitize_subject(subject: str) -> str:
 
 
 def _send_email_sync(
-    config: EmailConfig, subject: str, text_body: str, html_body: str
-) -> None:
+    config: EmailConfig,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    delivery_id: str,
+    phase: str,
+) -> tuple[dict[str, tuple[int, bytes]], str]:
     message = EmailMessage()
     message["From"] = config.from_address
     message["To"] = ", ".join(config.to_addresses)
     message["Subject"] = subject
+    message["Date"] = format_email_datetime(datetime.now(timezone.utc))
+    _, parsed_from_address = parseaddr(config.from_address)
+    message["Message-ID"] = make_msgid(
+        idstring=f"{delivery_id}.{phase}",
+        domain=parsed_from_address.rpartition("@")[2] or None,
+    )
+    message["X-Deploy-Webhook-Delivery"] = delivery_id
+    message["X-Deploy-Webhook-Phase"] = phase
     message.set_content(text_body, charset="utf-8")
     message.add_alternative(html_body, subtype="html", charset="utf-8")
 
@@ -476,8 +503,8 @@ def _send_email_sync(
             timeout=config.timeout_seconds,
             context=tls_context,
         ) as client:
-            _authenticate_and_send(client, config, message)
-        return
+            refused = _authenticate_and_send(client, config, message)
+            return refused, str(message["Message-ID"])
 
     with smtplib.SMTP(
         config.smtp_host,
@@ -489,15 +516,16 @@ def _send_email_sync(
         if config.tls_mode == "starttls":
             client.starttls(context=tls_context)
             client.ehlo()
-        _authenticate_and_send(client, config, message)
+        refused = _authenticate_and_send(client, config, message)
+        return refused, str(message["Message-ID"])
 
 
 def _authenticate_and_send(
     client: smtplib.SMTP, config: EmailConfig, message: EmailMessage
-) -> None:
+) -> dict[str, tuple[int, bytes]]:
     if config.smtp_username:
         client.login(config.smtp_username, config.smtp_password)
-    client.send_message(message)
+    return client.send_message(message)
 
 
 def render_received_email(

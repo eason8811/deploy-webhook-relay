@@ -517,18 +517,55 @@ def test_smtp_ssl_builds_multipart_message(load_environment, monkeypatch):
 
         def send_message(self, message):
             captured["message"] = message
+            return {}
 
     monkeypatch.setattr(module.smtplib, "SMTP_SSL", FakeSMTP)
-    module._send_email_sync(config, "主题", "纯文本", "<strong>HTML</strong>")
+    refused, message_id = module._send_email_sync(
+        config,
+        "主题",
+        "纯文本",
+        "<strong>HTML</strong>",
+        "delivery-123",
+        "received",
+    )
 
     assert captured["host"] == "smtp.example.com"
     assert captured["port"] == 465
     assert captured["local_hostname"] == "localhost"
     assert captured["login"] == ("sender@example.com", "secret")
     message = captured["message"]
+    assert refused == {}
+    assert message_id == message["Message-ID"]
     assert message.is_multipart()
+    assert message["Date"]
+    assert "delivery-123.received" in message["Message-ID"]
+    assert message["X-Deploy-Webhook-Delivery"] == "delivery-123"
+    assert message["X-Deploy-Webhook-Phase"] == "received"
     assert message.get_body(preferencelist=("plain",)).get_content().strip() == "纯文本"
     assert (
         "<strong>HTML</strong>"
         in message.get_body(preferencelist=("html",)).get_content()
     )
+
+
+def test_send_email_reports_refused_recipient(load_environment, monkeypatch):
+    module = load_environment("production", "app.notifications")
+    config = make_config(module)
+
+    def fake_send(*args):
+        return {"recipient@example.com": (550, b"rejected")}, "<refused@example.com>"
+
+    monkeypatch.setattr(module, "_send_email_sync", fake_send)
+    result = asyncio.run(
+        module.send_email(
+            config,
+            subject="subject",
+            text_body="text",
+            html_body="<p>html</p>",
+            delivery_id="delivery-refused",
+            phase="received",
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert result is False
