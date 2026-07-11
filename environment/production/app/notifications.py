@@ -288,7 +288,7 @@ async def resolve_merged_pull_request(
     api_version: str,
     logger: logging.Logger,
 ) -> PullRequestInfo | None:
-    """Return the PR merged by ``context.after``; never infer it from a message."""
+    """Verify the PR merged by ``context.after`` without trusting its message alone."""
     if not token:
         raise PullRequestVerificationError("GITHUB_TOKEN is not configured")
     if "/" not in context.repository or not context.after:
@@ -303,27 +303,60 @@ async def resolve_merged_pull_request(
         "X-GitHub-Api-Version": api_version,
     }
 
+    inferred = infer_pull_request(context)
+    inferred_number = inferred.number if inferred.is_merge else None
+    payload: list[Any] = []
+    candidates: list[dict[str, Any]] = []
+
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds), follow_redirects=True
         ) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
-        if not isinstance(payload, list):
-            raise ValueError("GitHub PR lookup returned a non-list payload")
+            for attempt in range(3):
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                response_payload = response.json()
+                if not isinstance(response_payload, list):
+                    raise ValueError("GitHub PR lookup returned a non-list payload")
+                payload = response_payload
+                candidates = [
+                    item
+                    for item in payload
+                    if isinstance(item, dict)
+                    and item.get("merged_at")
+                    and ((item.get("base") or {}).get("ref") == context.target_branch)
+                    and (
+                        item.get("merge_commit_sha") == context.after
+                        or (
+                            inferred_number is not None
+                            and _optional_int(item.get("number")) == inferred_number
+                        )
+                    )
+                ]
+                if candidates:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (2**attempt))
     except Exception as exc:  # noqa: BLE001
         raise PullRequestVerificationError(type(exc).__name__) from exc
 
-    candidates = [
-        item
-        for item in payload
-        if isinstance(item, dict)
-        and item.get("merged_at")
-        and item.get("merge_commit_sha") == context.after
-        and ((item.get("base") or {}).get("ref") == context.target_branch)
-    ]
     if not candidates:
+        logger.info(
+            "No merged PR matched delivery_id=%s after=%s inferred_pr=%s associated_prs=%s",
+            context.delivery_id,
+            context.after,
+            inferred_number,
+            [
+                {
+                    "number": item.get("number"),
+                    "merged_at": item.get("merged_at"),
+                    "merge_commit_sha": item.get("merge_commit_sha"),
+                    "base_ref": (item.get("base") or {}).get("ref"),
+                }
+                for item in payload
+                if isinstance(item, dict)
+            ],
+        )
         return None
 
     selected = max(candidates, key=lambda item: str(item.get("merged_at") or ""))

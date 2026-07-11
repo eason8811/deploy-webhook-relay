@@ -128,6 +128,120 @@ def test_github_api_result_takes_precedence(
     assert result.head_ref == "ci/prod/core/1fe1fc9aa159"
 
 
+def test_strict_pr_verification_accepts_associated_merge_when_api_sha_is_stale(
+    load_environment, payload_fixture, monkeypatch
+):
+    module = load_environment("test", "app.notifications")
+    context = make_context(module, payload_fixture("test_merge.json"))
+
+    class FakeResponse:
+        def __init__(self, merged_at):
+            self.merged_at = merged_at
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "number": 27,
+                    "title": "Update test images",
+                    "html_url": "https://github.com/eason8811/apex-camp-deploy/pull/27",
+                    "merged_at": self.merged_at,
+                    "merge_commit_sha": "github-test-merge-sha-not-push-after",
+                    "head": {"ref": "ci/test/apex-community-c83496c693a4"},
+                    "base": {"ref": "main"},
+                    "merged_by": {"login": "eason8811"},
+                }
+            ]
+
+    class FakeClient:
+        call_count = 0
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, url, headers):
+            assert context.after in url
+            self.__class__.call_count += 1
+            merged_at = (
+                None
+                if self.__class__.call_count == 1
+                else "2026-07-10T03:40:01Z"
+            )
+            return FakeResponse(merged_at)
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(
+        module.resolve_merged_pull_request(
+            context,
+            token="token",
+            timeout_seconds=5,
+            api_version="2026-03-10",
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert result is not None
+    assert result.source == "github_api"
+    assert result.number == 27
+    assert result.head_ref == "ci/test/apex-community-c83496c693a4"
+    assert FakeClient.call_count == 2
+
+
+def test_strict_pr_verification_rejects_different_associated_pr_number(
+    load_environment, payload_fixture, monkeypatch
+):
+    module = load_environment("test", "app.notifications")
+    context = make_context(module, payload_fixture("test_merge.json"))
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "number": 999,
+                    "merged_at": "2026-07-10T03:40:01Z",
+                    "merge_commit_sha": "a-different-commit",
+                    "base": {"ref": "main"},
+                }
+            ]
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, url, headers):
+            return FakeResponse()
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(
+        module.resolve_merged_pull_request(
+            context,
+            token="token",
+            timeout_seconds=5,
+            api_version="2026-03-10",
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert result is None
+
+
 def test_strict_pr_verification_rejects_a_non_merge_commit(
     load_environment, payload_fixture, monkeypatch
 ):
