@@ -294,8 +294,15 @@ async def resolve_merged_pull_request(
     if "/" not in context.repository or not context.after:
         raise PullRequestVerificationError("push payload is missing repository or after")
 
+    inferred = infer_pull_request(context)
+    inferred_number = inferred.number if inferred.is_merge else None
     owner, repository = context.repository.split("/", 1)
     url = f"https://api.github.com/repos/{owner}/{repository}/commits/{context.after}/pulls"
+    pull_url = (
+        f"https://api.github.com/repos/{owner}/{repository}/pulls/{inferred_number}"
+        if inferred_number is not None
+        else ""
+    )
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -303,8 +310,6 @@ async def resolve_merged_pull_request(
         "X-GitHub-Api-Version": api_version,
     }
 
-    inferred = infer_pull_request(context)
-    inferred_number = inferred.number if inferred.is_merge else None
     payload: list[Any] = []
     candidates: list[dict[str, Any]] = []
 
@@ -333,6 +338,23 @@ async def resolve_merged_pull_request(
                         )
                     )
                 ]
+                if not candidates and not payload and pull_url:
+                    pull_response = await client.get(pull_url, headers=headers)
+                    pull_response.raise_for_status()
+                    pull_payload = pull_response.json()
+                    if not isinstance(pull_payload, dict):
+                        raise ValueError("GitHub PR lookup returned a non-object payload")
+                    payload = [pull_payload]
+                    if (
+                        pull_payload.get("merged_at")
+                        and pull_payload.get("merge_commit_sha") == context.after
+                        and (
+                            (pull_payload.get("base") or {}).get("ref")
+                            == context.target_branch
+                        )
+                        and _optional_int(pull_payload.get("number")) == inferred_number
+                    ):
+                        candidates = [pull_payload]
                 if candidates:
                     break
                 if attempt < 2:
@@ -342,7 +364,7 @@ async def resolve_merged_pull_request(
 
     if not candidates:
         logger.info(
-            "No merged PR matched delivery_id=%s after=%s inferred_pr=%s associated_prs=%s",
+            "No merged PR matched delivery_id=%s after=%s inferred_pr=%s github_prs=%s",
             context.delivery_id,
             context.after,
             inferred_number,

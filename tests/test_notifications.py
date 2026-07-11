@@ -195,6 +195,68 @@ def test_strict_pr_verification_accepts_associated_merge_when_api_sha_is_stale(
     assert FakeClient.call_count == 2
 
 
+def test_strict_pr_verification_uses_numbered_pr_when_commit_association_is_empty(
+    load_environment, payload_fixture, monkeypatch
+):
+    module = load_environment("test", "app.notifications")
+    context = make_context(module, payload_fixture("test_merge.json"))
+    requested_urls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, url, headers):
+            requested_urls.append(url)
+            if "/commits/" in url:
+                return FakeResponse([])
+            assert url.endswith("/pulls/27")
+            return FakeResponse(
+                {
+                    "number": 27,
+                    "title": "Update test images",
+                    "html_url": "https://github.com/eason8811/apex-camp-deploy/pull/27",
+                    "merged_at": "2026-07-10T03:40:01Z",
+                    "merge_commit_sha": context.after,
+                    "head": {"ref": "ci/test/apex-community-c83496c693a4"},
+                    "base": {"ref": "main"},
+                    "merged_by": {"login": "eason8811"},
+                }
+            )
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(
+        module.resolve_merged_pull_request(
+            context,
+            token="token",
+            timeout_seconds=5,
+            api_version="2026-03-10",
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert result is not None
+    assert result.source == "github_api"
+    assert result.number == 27
+    assert len(requested_urls) == 2
+
+
 def test_strict_pr_verification_rejects_different_associated_pr_number(
     load_environment, payload_fixture, monkeypatch
 ):
