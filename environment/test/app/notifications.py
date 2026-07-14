@@ -367,7 +367,20 @@ async def resolve_merged_pull_request(
                     for item in payload
                 ):
                     merge_metadata_pending = True
-                if not candidates and not payload and pull_url:
+                matching_association_missing_sha = any(
+                    isinstance(item, dict)
+                    and ((item.get("base") or {}).get("ref") == context.target_branch)
+                    and _optional_int(item.get("number")) == inferred_number
+                    and not item.get("merge_commit_sha")
+                    for item in payload
+                )
+                # The commit-association endpoint can return a matching PR
+                # before its merge metadata is complete.  Consult the
+                # canonical PR endpoint when the list is empty or the matching
+                # entry is missing ``merge_commit_sha``.
+                if not candidates and pull_url and (
+                    not payload or matching_association_missing_sha
+                ):
                     pull_payload = await get_json(pull_url)
                     if not isinstance(pull_payload, dict):
                         raise ValueError("GitHub PR lookup returned a non-object payload")
