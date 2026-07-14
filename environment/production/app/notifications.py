@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import format_datetime as format_email_datetime
 from email.utils import make_msgid, parseaddr
+from time import monotonic
 from typing import Any, Iterable
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -288,6 +289,7 @@ async def resolve_merged_pull_request(
     timeout_seconds: float,
     api_version: str,
     logger: logging.Logger,
+    max_wait_seconds: float = 8.0,
 ) -> PullRequestInfo | None:
     """Verify the PR merged by ``context.after`` without trusting its message alone."""
     if not token:
@@ -313,15 +315,33 @@ async def resolve_merged_pull_request(
 
     payload: list[Any] = []
     candidates: list[dict[str, Any]] = []
+    merge_metadata_pending = False
+    deadline = monotonic() + max(0.5, max_wait_seconds)
+    backoff_seconds = 0.25
+    attempt = 0
 
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds), follow_redirects=True
         ) as client:
-            for attempt in range(3):
-                response = await client.get(url, headers=headers)
-                response.raise_for_status()
-                response_payload = response.json()
+            while True:
+                remaining_seconds = deadline - monotonic()
+                if attempt > 0 and remaining_seconds <= 0:
+                    break
+
+                async def get_json(request_url: str) -> Any:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    response = await asyncio.wait_for(
+                        client.get(request_url, headers=headers),
+                        timeout=min(timeout_seconds, max(0.1, remaining)),
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+                attempt += 1
+                response_payload = await get_json(url)
                 if not isinstance(response_payload, list):
                     raise ValueError("GitHub PR lookup returned a non-list payload")
                 payload = response_payload
@@ -330,6 +350,7 @@ async def resolve_merged_pull_request(
                     for item in payload
                     if isinstance(item, dict)
                     and item.get("merged_at")
+                    and item.get("merge_commit_sha")
                     and ((item.get("base") or {}).get("ref") == context.target_branch)
                     and (
                         item.get("merge_commit_sha") == context.after
@@ -339,10 +360,15 @@ async def resolve_merged_pull_request(
                         )
                     )
                 ]
+                if inferred_number is not None and not candidates and any(
+                    isinstance(item, dict)
+                    and ((item.get("base") or {}).get("ref") == context.target_branch)
+                    and _optional_int(item.get("number")) == inferred_number
+                    for item in payload
+                ):
+                    merge_metadata_pending = True
                 if not candidates and not payload and pull_url:
-                    pull_response = await client.get(pull_url, headers=headers)
-                    pull_response.raise_for_status()
-                    pull_payload = pull_response.json()
+                    pull_payload = await get_json(pull_url)
                     if not isinstance(pull_payload, dict):
                         raise ValueError("GitHub PR lookup returned a non-object payload")
                     payload = [pull_payload]
@@ -356,14 +382,30 @@ async def resolve_merged_pull_request(
                         and _optional_int(pull_payload.get("number")) == inferred_number
                     ):
                         candidates = [pull_payload]
+                    elif (
+                        (pull_payload.get("base") or {}).get("ref")
+                        == context.target_branch
+                        and _optional_int(pull_payload.get("number"))
+                        == inferred_number
+                    ):
+                        merge_metadata_pending = True
                 if candidates:
                     break
-                if attempt < 2:
-                    await asyncio.sleep(0.25 * (2**attempt))
+                if not pull_url or (payload and not merge_metadata_pending):
+                    break
+                remaining_seconds = deadline - monotonic()
+                if remaining_seconds <= 0:
+                    break
+                await asyncio.sleep(min(backoff_seconds, remaining_seconds))
+                backoff_seconds = min(backoff_seconds * 2, 2.0)
     except Exception as exc:  # noqa: BLE001
         raise PullRequestVerificationError(type(exc).__name__) from exc
 
     if not candidates:
+        if merge_metadata_pending:
+            raise PullRequestVerificationError(
+                "GitHub PR merge_commit_sha is not available yet"
+            )
         logger.info(
             "No merged PR matched delivery_id=%s after=%s inferred_pr=%s github_prs=%s",
             context.delivery_id,

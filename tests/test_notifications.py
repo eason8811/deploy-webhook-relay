@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 
 def make_config(module):
     return module.EmailConfig(
@@ -255,6 +257,120 @@ def test_strict_pr_verification_uses_numbered_pr_when_commit_association_is_empt
     assert result.source == "github_api"
     assert result.number == 27
     assert len(requested_urls) == 2
+
+
+def test_strict_pr_verification_retries_until_merge_commit_sha_is_available(
+    load_environment, payload_fixture, monkeypatch
+):
+    module = load_environment("test")
+    context = make_context(module, payload_fixture("test_merge.json"))
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        pull_calls = 0
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, url, headers):
+            if "/commits/" in url:
+                return FakeResponse([])
+            self.__class__.pull_calls += 1
+            merge_commit_sha = (
+                None if self.__class__.pull_calls == 1 else context.after
+            )
+            return FakeResponse(
+                {
+                    "number": 27,
+                    "title": "Update test images",
+                    "html_url": "https://github.com/eason8811/apex-camp-deploy/pull/27",
+                    "merged_at": "2026-07-10T03:40:01Z",
+                    "merge_commit_sha": merge_commit_sha,
+                    "head": {"ref": "ci/test/apex-community-c83496c693a4"},
+                    "base": {"ref": "main"},
+                    "merged_by": {"login": "eason8811"},
+                }
+            )
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(
+        module.resolve_merged_pull_request(
+            context,
+            token="token",
+            timeout_seconds=5,
+            api_version="2026-03-10",
+            logger=logging.getLogger("test"),
+            max_wait_seconds=1,
+        )
+    )
+
+    assert result is not None
+    assert result.number == 27
+    assert FakeClient.pull_calls == 2
+
+
+def test_strict_pr_verification_returns_retryable_error_when_merge_sha_stays_pending(
+    load_environment, payload_fixture, monkeypatch
+):
+    module = load_environment("test")
+    context = make_context(module, payload_fixture("test_merge.json"))
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            if "/pulls/27" in self.url:
+                return {
+                    "number": 27,
+                    "merged_at": "2026-07-10T03:40:01Z",
+                    "merge_commit_sha": None,
+                    "base": {"ref": "main"},
+                }
+            return []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.url = ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, url, headers):
+            response = FakeResponse()
+            response.url = url
+            return response
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+    with pytest.raises(module.PullRequestVerificationError):
+        asyncio.run(
+            module.resolve_merged_pull_request(
+                context,
+                token="token",
+                timeout_seconds=5,
+                api_version="2026-03-10",
+                logger=logging.getLogger("test"),
+                max_wait_seconds=0.5,
+            )
+        )
 
 
 def test_strict_pr_verification_rejects_different_associated_pr_number(

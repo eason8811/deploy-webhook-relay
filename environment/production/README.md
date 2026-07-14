@@ -20,9 +20,11 @@ For every accepted delivery, the relay can send two Arcane-styled emails:
 2. A result email after all Arcane targets finish. A target is successful only
    when Arcane returns HTTP 2xx and JSON `success=true`.
 
-Production targets remain sequential (`core` then `portal`). Arcane, GitHub API,
-and SMTP calls are not retried. Failure or timeout details are included in the
-result email and logs.
+Production targets remain sequential (`core` then `portal`). GitHub merge
+metadata lookup uses bounded exponential backoff (controlled by
+`GITHUB_PR_VERIFICATION_MAX_SECONDS`, default 8 seconds); Arcane and SMTP calls
+are not retried. Failure or timeout details are included in the result email and
+logs.
 
 Start:
 

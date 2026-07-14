@@ -43,6 +43,9 @@ HTTP_CONNECT_TIMEOUT_SECONDS = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "600"))
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_API_TIMEOUT_SECONDS = float(os.getenv("GITHUB_API_TIMEOUT_SECONDS", "5"))
+GITHUB_PR_VERIFICATION_MAX_SECONDS = float(
+    os.getenv("GITHUB_PR_VERIFICATION_MAX_SECONDS", "8")
+)
 GITHUB_API_VERSION = os.getenv("GITHUB_API_VERSION", "2026-03-10")
 CI_PULL_REQUEST_HEAD_PREFIXES = tuple(
     prefix.strip()
@@ -308,6 +311,7 @@ def healthz() -> Dict[str, Any]:
         "email_enabled": EMAIL_CONFIG.enabled,
         "email_configured": EMAIL_CONFIG.configured,
         "github_pr_merge_verification_configured": bool(GITHUB_TOKEN),
+        "github_pr_verification_max_seconds": GITHUB_PR_VERIFICATION_MAX_SECONDS,
         "ci_pull_request_head_prefixes": CI_PULL_REQUEST_HEAD_PREFIXES,
         "arcane_connect_timeout_seconds": HTTP_CONNECT_TIMEOUT_SECONDS,
         "arcane_read_timeout_seconds": HTTP_TIMEOUT_SECONDS,
@@ -395,6 +399,7 @@ async def github_deploy_webhook(
             timeout_seconds=GITHUB_API_TIMEOUT_SECONDS,
             api_version=GITHUB_API_VERSION,
             logger=logger,
+            max_wait_seconds=GITHUB_PR_VERIFICATION_MAX_SECONDS,
         )
     except PullRequestVerificationError as exc:
         logger.error(

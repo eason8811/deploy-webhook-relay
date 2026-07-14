@@ -26,5 +26,7 @@ The default `CI_PULL_REQUEST_HEAD_PREFIXES=ci/` accepts CI branches such as
 `ci/test/...`; set it to a comma-separated list if the CI naming changes. If
 GitHub cannot be queried, the endpoint returns HTTP 503 and does not call
 Arcane. Start with `EMAIL_ENABLED=true` and `DRY_RUN=true` to
-verify the received and skipped-result emails without invoking Arcane. SMTP,
-GitHub API, and Arcane calls are not retried.
+verify the received and skipped-result emails without invoking Arcane. GitHub
+merge metadata lookup uses bounded exponential backoff (controlled by
+`GITHUB_PR_VERIFICATION_MAX_SECONDS`, default 8 seconds); SMTP and Arcane calls
+are not retried.
