@@ -345,20 +345,20 @@ async def resolve_merged_pull_request(
                 if not isinstance(response_payload, list):
                     raise ValueError("GitHub PR lookup returned a non-list payload")
                 payload = response_payload
-                candidates = [
+                matching_association = [
                     item
                     for item in payload
                     if isinstance(item, dict)
-                    and item.get("merged_at")
-                    and item.get("merge_commit_sha")
                     and ((item.get("base") or {}).get("ref") == context.target_branch)
-                    and (
-                        item.get("merge_commit_sha") == context.after
-                        or (
-                            inferred_number is not None
-                            and _optional_int(item.get("number")) == inferred_number
-                        )
-                    )
+                    and inferred_number is not None
+                    and _optional_int(item.get("number")) == inferred_number
+                ]
+                # The commit-association endpoint is already scoped to
+                # ``context.after``. A merged PR with the expected number
+                # and base branch proves the association even when newer
+                # GitHub API versions omit ``merge_commit_sha``.
+                candidates = [
+                    item for item in matching_association if item.get("merged_at")
                 ]
                 if inferred_number is not None and not candidates and any(
                     isinstance(item, dict)
@@ -367,40 +367,36 @@ async def resolve_merged_pull_request(
                     for item in payload
                 ):
                     merge_metadata_pending = True
-                matching_association_missing_sha = any(
-                    isinstance(item, dict)
-                    and ((item.get("base") or {}).get("ref") == context.target_branch)
-                    and _optional_int(item.get("number")) == inferred_number
-                    and not item.get("merge_commit_sha")
-                    for item in payload
+                matching_association_metadata_incomplete = any(
+                    not item.get("merged_at") for item in matching_association
                 )
                 # The commit-association endpoint can return a matching PR
-                # before its merge metadata is complete.  Consult the
+                # before its merged metadata is complete. Consult the
                 # canonical PR endpoint when the list is empty or the matching
-                # entry is missing ``merge_commit_sha``.
+                # entry is not merged yet.
                 if not candidates and pull_url and (
-                    not payload or matching_association_missing_sha
+                    not payload or matching_association_metadata_incomplete
                 ):
                     pull_payload = await get_json(pull_url)
                     if not isinstance(pull_payload, dict):
                         raise ValueError("GitHub PR lookup returned a non-object payload")
                     payload = [pull_payload]
-                    if (
-                        pull_payload.get("merged_at")
-                        and pull_payload.get("merge_commit_sha") == context.after
-                        and (
-                            (pull_payload.get("base") or {}).get("ref")
-                            == context.target_branch
-                        )
-                        and _optional_int(pull_payload.get("number")) == inferred_number
-                    ):
-                        candidates = [pull_payload]
-                    elif (
+                    canonical_matches_association = (
                         (pull_payload.get("base") or {}).get("ref")
                         == context.target_branch
                         and _optional_int(pull_payload.get("number"))
                         == inferred_number
+                    )
+                    if (
+                        pull_payload.get("merged_at")
+                        and canonical_matches_association
+                        and (
+                            pull_payload.get("merge_commit_sha") == context.after
+                            or bool(matching_association)
+                        )
                     ):
+                        candidates = [pull_payload]
+                    elif canonical_matches_association:
                         merge_metadata_pending = True
                 if candidates:
                     break
@@ -417,7 +413,7 @@ async def resolve_merged_pull_request(
     if not candidates:
         if merge_metadata_pending:
             raise PullRequestVerificationError(
-                "GitHub PR merge_commit_sha is not available yet"
+                "GitHub merged pull request association metadata is not available yet"
             )
         logger.info(
             "No merged PR matched delivery_id=%s after=%s inferred_pr=%s github_prs=%s",

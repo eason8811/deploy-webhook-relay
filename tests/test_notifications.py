@@ -137,25 +137,25 @@ def test_strict_pr_verification_accepts_associated_merge_when_api_sha_is_stale(
     context = make_context(module, payload_fixture("test_merge.json"))
 
     class FakeResponse:
-        def __init__(self, merged_at):
+        def __init__(self, merged_at, canonical):
             self.merged_at = merged_at
+            self.canonical = canonical
 
         def raise_for_status(self):
             return None
 
         def json(self):
-            return [
-                {
-                    "number": 27,
-                    "title": "Update test images",
-                    "html_url": "https://github.com/eason8811/apex-camp-deploy/pull/27",
-                    "merged_at": self.merged_at,
-                    "merge_commit_sha": "github-test-merge-sha-not-push-after",
-                    "head": {"ref": "ci/test/apex-community-c83496c693a4"},
-                    "base": {"ref": "main"},
-                    "merged_by": {"login": "eason8811"},
-                }
-            ]
+            payload = {
+                "number": 27,
+                "title": "Update test images",
+                "html_url": "https://github.com/eason8811/apex-camp-deploy/pull/27",
+                "merged_at": self.merged_at,
+                "merge_commit_sha": "github-test-merge-sha-not-push-after",
+                "head": {"ref": "ci/test/apex-community-c83496c693a4"},
+                "base": {"ref": "main"},
+                "merged_by": {"login": "eason8811"},
+            }
+            return payload if self.canonical else [payload]
 
     class FakeClient:
         call_count = 0
@@ -170,14 +170,13 @@ def test_strict_pr_verification_accepts_associated_merge_when_api_sha_is_stale(
             return False
 
         async def get(self, url, headers):
-            assert context.after in url
             self.__class__.call_count += 1
             merged_at = (
                 None
                 if self.__class__.call_count == 1
                 else "2026-07-10T03:40:01Z"
             )
-            return FakeResponse(merged_at)
+            return FakeResponse(merged_at, canonical="/pulls/" in url)
 
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
     result = asyncio.run(
@@ -259,7 +258,7 @@ def test_strict_pr_verification_uses_numbered_pr_when_commit_association_is_empt
     assert len(requested_urls) == 2
 
 
-def test_strict_pr_verification_uses_numbered_pr_when_association_metadata_is_incomplete(
+def test_strict_pr_verification_accepts_association_without_merge_commit_sha(
     load_environment, payload_fixture, monkeypatch
 ):
     module = load_environment("test", "app.notifications")
@@ -330,12 +329,13 @@ def test_strict_pr_verification_uses_numbered_pr_when_association_metadata_is_in
     assert result is not None
     assert result.source == "github_api"
     assert result.number == 27
-    assert len(requested_urls) == 2
+    # The commit-association endpoint is already scoped to context.after, so
+    # the PR can be verified without the removed merge_commit_sha field.
+    assert len(requested_urls) == 1
     assert requested_urls[0].endswith(f"/commits/{context.after}/pulls")
-    assert requested_urls[1].endswith("/pulls/27")
 
 
-def test_strict_pr_verification_retries_until_merge_commit_sha_is_available(
+def test_strict_pr_verification_retries_until_canonical_merge_metadata_is_available(
     load_environment, payload_fixture, monkeypatch
 ):
     module = load_environment("test")
@@ -400,7 +400,7 @@ def test_strict_pr_verification_retries_until_merge_commit_sha_is_available(
     assert FakeClient.pull_calls == 2
 
 
-def test_strict_pr_verification_returns_retryable_error_when_merge_sha_stays_pending(
+def test_strict_pr_verification_returns_retryable_error_without_commit_association(
     load_environment, payload_fixture, monkeypatch
 ):
     module = load_environment("test")
